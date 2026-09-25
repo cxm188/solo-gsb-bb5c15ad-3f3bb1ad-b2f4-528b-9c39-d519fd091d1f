@@ -328,6 +328,38 @@
   <div id="posResult"></div>
 </div>
 
+<hr class="feature-divider">
+<h1 id="chapter">字幕章节索引</h1>
+<p class="hint">粘贴或上传 SRT，填写<strong>目标、最短、最长章节时长</strong>（秒，均为正数且 最短 ≤ 目标 ≤ 最长）。
+只允许在<strong>相邻字幕之间</strong>切分，章节覆盖全部字幕；每章跨度为<strong>章内首条起点 → 末条终点</strong>，且必须落在最短 / 最长范围内。
+全局规划依次使<strong>各章与目标时长的绝对偏差之和最小</strong>、<strong>切点处字幕间隙总时长最大</strong>，仍并列时取<strong>切点序列字典序最小</strong>的方案；
+无可行切分时给出原因并禁止下载。字幕出现<strong>空时长、起止倒置或轨内重叠</strong>会直接报错。预览每章起止、条数与首句，确认后可下载 UTF-8 CSV 章节索引。</p>
+
+<div class="card">
+  <h2>16. SRT 与章节时长参数</h2>
+  <input type="file" id="chFile" accept=".srt,.txt">
+  <textarea id="chSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;第一句字幕&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;第二句字幕"></textarea>
+  <div class="toolbar">
+    <span class="hint">目标时长(秒)</span>
+    <input type="number" id="chTarget" min="0" step="1" value="600" style="width:110px">
+    <span class="hint">最短时长(秒)</span>
+    <input type="number" id="chMin" min="0" step="1" value="300" style="width:110px">
+    <span class="hint">最长时长(秒)</span>
+    <input type="number" id="chMax" min="0" step="1" value="900" style="width:110px">
+  </div>
+</div>
+
+<div class="card">
+  <h2>17. 预览与下载章节索引 CSV</h2>
+  <div class="toolbar">
+    <button onclick="chapterPreview()">预览章节切分</button>
+    <button id="chExportBtn" onclick="chapterExport()" disabled>下载章节索引 CSV</button>
+    <span class="hint" id="chExportHint">请先预览，存在可行切分时才能下载</span>
+  </div>
+  <div id="chMessage"></div>
+  <div id="chResult"></div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 
@@ -1180,6 +1212,100 @@ async function posExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "positioned.vtt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 字幕章节索引
+
+bindTrackFile("chFile", "chSrt");
+
+function chapterParams() {
+  const target = parseFloat($("chTarget").value);
+  const minS = parseFloat($("chMin").value);
+  const maxS = parseFloat($("chMax").value);
+  if (!isFinite(target) || target <= 0) { showChapterError("目标章节时长须为正数"); return null; }
+  if (!isFinite(minS) || minS <= 0) { showChapterError("最短章节时长须为正数"); return null; }
+  if (!isFinite(maxS) || maxS <= 0) { showChapterError("最长章节时长须为正数"); return null; }
+  if (!(minS <= target && target <= maxS)) {
+    showChapterError("章节时长须满足 最短 ≤ 目标 ≤ 最长"); return null;
+  }
+  return { srt: $("chSrt").value, target_seconds: target, min_seconds: minS, max_seconds: maxS };
+}
+
+function showChapterError(msg) {
+  $("chMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("chResult").innerHTML = "";
+  $("chExportBtn").disabled = true;
+}
+
+function chErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function renderChapterPreview(pv) {
+  const rows = pv.chapters.map(c => `
+    <tr>
+      <td>${c.seq}</td>
+      <td class="mono">${escapeHtml(c.start)} --&gt; ${escapeHtml(c.end)}</td>
+      <td>${(c.duration_ms / 1000).toFixed(2)}s</td>
+      <td>${c.entry_count}</td>
+      <td class="mono">${escapeHtml(c.first_index)}${c.last_index !== c.first_index ? " – " + escapeHtml(c.last_index) : ""}</td>
+      <td>${(c.deviation_ms / 1000).toFixed(2)}s</td>
+      <td class="mono">${escapeHtml(c.first_line)}</td>
+    </tr>`).join("");
+  $("chResult").innerHTML = `<table>
+    <tr><th style="width:3em">章</th><th>起止时间</th><th>时长</th><th>条数</th><th>原序号</th><th>与目标偏差</th><th>首句</th></tr>
+    ${rows}</table>`;
+  $("chMessage").innerHTML =
+    `<div class="ok-banner">✓ 共 ${pv.entry_count} 条字幕 → ${pv.chapter_count} 章，` +
+    `每章跨度均在 [${pv.min_seconds}, ${pv.max_seconds}] 秒内；` +
+    `与目标总偏差 ${(pv.total_deviation_ms / 1000).toFixed(2)} 秒，` +
+    `切点处字幕间隙总计 ${(pv.total_gap_ms / 1000).toFixed(2)} 秒，可以下载。</div>`;
+  $("chExportBtn").disabled = false;
+}
+
+async function chapterPreview() {
+  $("chMessage").innerHTML = "";
+  const body = chapterParams();
+  if (!body) return;
+  let res;
+  try {
+    res = await fetch("/api/chapter/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch (e) { return showChapterError("网络错误：" + e); }
+  const data = await res.json();
+  if (!res.ok) return showChapterError(chErrDetail(data));
+  if (!data.feasible) {
+    $("chResult").innerHTML = "";
+    $("chMessage").innerHTML = `<div class="bad-banner">✗ 无法切分：${escapeHtml(data.reason)}</div>`;
+    $("chExportBtn").disabled = true;
+    return;
+  }
+  renderChapterPreview(data);
+}
+
+async function chapterExport() {
+  const body = chapterParams();
+  if (!body) return;
+  let res;
+  try {
+    res = await fetch("/api/chapter/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch (e) { return showChapterError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showChapterError(chErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "chapters.csv";
   a.click();
   URL.revokeObjectURL(a.href);
 }

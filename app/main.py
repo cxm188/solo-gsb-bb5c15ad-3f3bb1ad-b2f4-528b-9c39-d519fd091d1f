@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2099,4 +2099,217 @@ def position_export(req: PositionRequest):
         content=content.encode("utf-8"),
         media_type="text/vtt; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="positioned.vtt"'},
+    )
+
+
+# ---------------------------------------------------------------- 字幕章节索引
+
+class ChapterRequest(BaseModel):
+    srt: str
+    target_seconds: float  # 目标章节时长（秒，正数）
+    min_seconds: float     # 最短章节时长（秒，正数）
+    max_seconds: float     # 最长章节时长（秒，正数）
+
+
+def _chapter_params(req: "ChapterRequest"):
+    """校验章节时长参数：均为正数且 最短 ≤ 目标 ≤ 最长。返回毫秒三元组。"""
+    for name, v in (("目标", req.target_seconds), ("最短", req.min_seconds),
+                    ("最长", req.max_seconds)):
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(f"{name}章节时长须为正数")
+    if not (req.min_seconds <= req.target_seconds <= req.max_seconds):
+        raise ValueError("章节时长须满足 最短 ≤ 目标 ≤ 最长")
+    return (req.target_seconds * 1000.0, req.min_seconds * 1000.0,
+            req.max_seconds * 1000.0)
+
+
+def plan_chapters(entries: List[dict], target_ms: float, min_ms: float,
+                  max_ms: float):
+    """章节切分的全局规划。
+
+    把按时间有序的字幕划分为若干连续章节：仅允许在相邻字幕之间切分，
+    章节覆盖全部字幕；每章跨度 = 章内首条起点 → 末条终点，且必须落在
+    [min_ms, max_ms] 内。目标依次为：
+      1) 各章跨度与目标时长的绝对偏差之和最小；
+      2) 切点处字幕间隙（后条起点 − 前条终点）总时长最大；
+      3) 切点序列（第 2 章起各章首条的下标，0 起，升序）字典序最小。
+
+    后缀 DP：dp[i] = (偏差和, 负间隙和, 切点序列) 为第 i 条起的最优后缀
+    方案，choice[i] 记录首章末条下标。终点严格递增，故跨度随章末单调，
+    超最长即可停止扩展。返回 (chapters, None)；无可行切分时 (None, 原因)。
+    """
+    n = len(entries)
+    starts = [e["start"] for e in entries]
+    ends = [e["end"] for e in entries]
+
+    dp = [None] * (n + 1)
+    dp[n] = (0.0, 0, ())
+    choice = [None] * n
+    for i in range(n - 1, -1, -1):
+        best = None
+        for j in range(i, n):
+            span = ends[j] - starts[i]
+            if span > max_ms:
+                break  # 终点严格递增，跨度只会更大
+            if span < min_ms or dp[j + 1] is None:
+                continue
+            dev = abs(span - target_ms) + dp[j + 1][0]
+            neg_gap = dp[j + 1][1] - (starts[j + 1] - ends[j] if j + 1 < n else 0)
+            if best is not None and (dev, neg_gap) > best[:2]:
+                continue  # 前两级已劣，无需构造切点序列
+            cuts = ((j + 1,) + dp[j + 1][2]) if j + 1 < n else ()
+            if best is None or (dev, neg_gap, cuts) < best[:3]:
+                best = (dev, neg_gap, cuts, j)
+        if best is not None:
+            dp[i] = best[:3]
+            choice[i] = best[3]
+
+    if dp[0] is None:
+        return None, _chapter_infeasible_reason(entries, dp, min_ms, max_ms)
+
+    chapters = []
+    i = 0
+    while i < n:
+        j = choice[i]
+        first_line = next(
+            (ln for e in entries[i:j + 1] for ln in e["lines"] if ln.strip()), ""
+        )
+        chapters.append({
+            "src_first": i + 1,
+            "src_last": j + 1,
+            "first_index": entries[i]["index"],
+            "last_index": entries[j]["index"],
+            "start": starts[i],
+            "end": ends[j],
+            "first_line": first_line,
+        })
+        i = j + 1
+    return chapters, None
+
+
+def _chapter_infeasible_reason(entries: List[dict], dp: list,
+                               min_ms: float, max_ms: float) -> str:
+    """定位最靠后的不可行章首，给出无法切分的具体原因。
+
+    bad 之后的位置均可行（bad 是最大的不可行下标），故从 bad 出发若存在
+    跨度落在 [min_ms, max_ms] 的章节，dp[bad] 就不会不可行——即不存在
+    任何章末使跨度落在范围内：要么单条自身已超最长，要么剩余总跨度不足
+    最短，要么跨度从不足最短直接跳过最长。
+    """
+    n = len(entries)
+    bad = max(i for i in range(n) if dp[i] is None)
+    e = entries[bad]
+    head = (f"第 {bad + 1} 条字幕（序号 {e['index']}，"
+            f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}）")
+    own_ms = e["end"] - e["start"]
+    if own_ms > max_ms:
+        return (
+            f"{head}自身时长 {own_ms / 1000:.3f} 秒已超过最长章节时长 "
+            f"{max_ms / 1000:g} 秒，无法切分"
+        )
+    rest_ms = entries[-1]["end"] - e["start"]
+    if rest_ms < min_ms:
+        return (
+            f"{head}起至末尾的剩余总跨度 {rest_ms / 1000:.3f} 秒已不足最短章节时长 "
+            f"{min_ms / 1000:g} 秒，无法切分"
+        )
+    # 跨度随章末单调递增：找到最后一个仍不足最短的章末，下一条即超过最长
+    j = bad
+    while entries[j + 1]["end"] - e["start"] < min_ms:
+        j += 1
+    short_ms = entries[j]["end"] - e["start"]
+    long_ms = entries[j + 1]["end"] - e["start"]
+    return (
+        f"{head}起：章末止于第 {j + 1} 条时跨度 {short_ms / 1000:.3f} 秒不足最短 "
+        f"{min_ms / 1000:g} 秒，延至第 {j + 2} 条时跨度 {long_ms / 1000:.3f} 秒"
+        f"超过最长 {max_ms / 1000:g} 秒，不存在落在范围内的切分"
+    )
+
+
+def _chapter_prepare(req: "ChapterRequest"):
+    """章节索引公共预处理：校验参数、解析并校验轨道，失败抛 400。"""
+    try:
+        target_ms, min_ms, max_ms = _chapter_params(req)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        entries = parse_srt(req.srt)
+        _validate_speed_track(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, target_ms, min_ms, max_ms
+
+
+def _chapter_payload(c: dict, seq: int, target_ms: float) -> dict:
+    span = c["end"] - c["start"]
+    return {
+        "seq": seq,
+        "start": fmt_time(c["start"]),
+        "end": fmt_time(c["end"]),
+        "start_ms": c["start"],
+        "end_ms": c["end"],
+        "duration_ms": span,
+        "deviation_ms": int(round(abs(span - target_ms))),
+        "entry_count": c["src_last"] - c["src_first"] + 1,
+        "first_index": c["first_index"],
+        "last_index": c["last_index"],
+        "first_line": c["first_line"],
+    }
+
+
+@app.post("/api/chapter/preview")
+def chapter_preview(req: ChapterRequest):
+    entries, target_ms, min_ms, max_ms = _chapter_prepare(req)
+    chapters, reason = plan_chapters(entries, target_ms, min_ms, max_ms)
+    if chapters is None:
+        return {"feasible": False, "reason": reason, "entry_count": len(entries)}
+    total_dev = sum(abs(c["end"] - c["start"] - target_ms) for c in chapters)
+    total_gap = sum(chapters[k]["start"] - chapters[k - 1]["end"]
+                    for k in range(1, len(chapters)))
+    return {
+        "feasible": True,
+        "entry_count": len(entries),
+        "chapter_count": len(chapters),
+        "target_seconds": req.target_seconds,
+        "min_seconds": req.min_seconds,
+        "max_seconds": req.max_seconds,
+        "total_deviation_ms": int(round(total_dev)),
+        "total_gap_ms": total_gap,
+        "cuts": [c["src_first"] for c in chapters[1:]],
+        "chapters": [
+            _chapter_payload(c, seq, target_ms)
+            for seq, c in enumerate(chapters, 1)
+        ],
+    }
+
+
+_CHAPTER_CSV_HEADER = ["章号", "起点(ms)", "终点(ms)", "时长(ms)",
+                       "起点", "终点", "字幕条数", "首句"]
+
+
+@app.post("/api/chapter/export")
+def chapter_export(req: ChapterRequest):
+    entries, target_ms, min_ms, max_ms = _chapter_prepare(req)
+    chapters, reason = plan_chapters(entries, target_ms, min_ms, max_ms)
+    if chapters is None:
+        raise HTTPException(status_code=400, detail=f"无法切分：{reason}")
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")  # RFC 4180：CRLF、按需加引号
+    writer.writerow(_CHAPTER_CSV_HEADER)
+    for k, c in enumerate(chapters, 1):
+        writer.writerow([
+            k,
+            c["start"],
+            c["end"],
+            c["end"] - c["start"],
+            fmt_time(c["start"]),
+            fmt_time(c["end"]),
+            c["src_last"] - c["src_first"] + 1,
+            c["first_line"],
+        ])
+    # UTF-8 BOM，确保 Excel 直接双击打开时中文不乱码
+    return Response(
+        content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="chapters.csv"'},
     )
