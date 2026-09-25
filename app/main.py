@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2099,4 +2099,231 @@ def position_export(req: PositionRequest):
         content=content.encode("utf-8"),
         media_type="text/vtt; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="positioned.vtt"'},
+    )
+
+
+# ---------------------------------------------------------------- 字幕章节索引
+
+class ChapterRequest(BaseModel):
+    srt: str
+    target_seconds: float  # 目标章节时长（秒）
+    min_seconds: float     # 最短章节时长（秒）
+    max_seconds: float     # 最长章节时长（秒）
+
+
+def _chapter_params(req: "ChapterRequest"):
+    """校验章节时长参数（均为正且 最短 ≤ 目标 ≤ 最长），返回毫秒三元组。
+
+    秒数按毫秒四舍五入量化，使偏差与间隙的比较全程为整数，并列判定确定。
+    """
+    for name, v in (("目标章节时长", req.target_seconds),
+                    ("最短章节时长", req.min_seconds),
+                    ("最长章节时长", req.max_seconds)):
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(f"{name}须为正数")
+    if not (req.min_seconds <= req.target_seconds <= req.max_seconds):
+        raise ValueError("章节时长须满足：最短 ≤ 目标 ≤ 最长")
+    return (int(round(req.target_seconds * 1000)),
+            int(round(req.min_seconds * 1000)),
+            int(round(req.max_seconds * 1000)))
+
+
+def plan_chapters(entries: List[dict], target_ms: int, min_ms: int, max_ms: int):
+    """章节切分的全局规划。
+
+    把按时间有序的字幕划分为若干连续章节：只允许在相邻字幕之间切分，
+    章节覆盖全部字幕；每章跨度 = 章内首条起点 → 末条终点，且必须落在
+    [min_ms, max_ms] 内。三级目标依次：
+      1) 各章跨度与目标时长的绝对偏差之和最小；
+      2) 切点处字幕间隙（后条起点 − 前条终点）总时长最大；
+      3) 切点位置序列（首章之后各新章首条的 0 起下标，升序）字典序最小。
+
+    后缀 DP：dp[i] = (偏差和, 负的间隙和) 为第 i 条起的最优后缀方案，
+    choice[i] 记录首章末条下标。终点严格递增 ⇒ 跨度随章尾单调，每个
+    起点的可行末条下标区间用二分直接定位。偏差与负间隙并列时按切点
+    序列字典序决胜：候选 j 的切点序列为 (j+1, ...)（j+1<n）或空序列
+    （j+1==n，即首章末条已是最后一条）；空序列字典序最小，均非空时
+    首元素小者（j 更小）胜出，故并列时仅当 j+1==n 才替换已选方案，
+    无需显式保存切点序列。
+    返回 (chapters, None)；无可行方案时返回 (None, 原因)。
+    """
+    from bisect import bisect_left, bisect_right
+
+    n = len(entries)
+    starts = [e["start"] for e in entries]
+    ends = [e["end"] for e in entries]
+    # gaps[j]：第 j 条后的切点间隙（j 为末条时为 0，不产生切点）
+    gaps = [starts[j + 1] - ends[j] for j in range(n - 1)] + [0]
+
+    dp = [None] * (n + 1)
+    dp[n] = (0, 0)
+    choice = [None] * n
+    for i in range(n - 1, -1, -1):
+        best_dev = best_ng = 0
+        best_j = -1
+        start_i = starts[i]
+        # 末条下标 j 的可行区间：min_ms <= ends[j] - start_i <= max_ms
+        lo = bisect_left(ends, start_i + min_ms, i)
+        hi = bisect_right(ends, start_i + max_ms, lo)
+        for j in range(lo, hi):
+            nxt = dp[j + 1]
+            if nxt is None:
+                continue
+            dev = abs(ends[j] - start_i - target_ms) + nxt[0]
+            ng = nxt[1] - gaps[j]
+            if (best_j < 0 or dev < best_dev
+                    or (dev == best_dev and (ng < best_ng
+                        or (ng == best_ng and j + 1 == n)))):
+                best_dev, best_ng, best_j = dev, ng, j
+        if best_j >= 0:
+            dp[i] = (best_dev, best_ng)
+            choice[i] = best_j
+
+    if dp[0] is None:
+        return None, _chapter_infeasible_reason(entries, dp, min_ms, max_ms)
+
+    chapters = []
+    i = 0
+    while i < n:
+        j = choice[i]
+        span = ends[j] - starts[i]
+        chapters.append({
+            "src_first": i + 1,
+            "src_last": j + 1,
+            "first_index": entries[i]["index"],
+            "last_index": entries[j]["index"],
+            "start": starts[i],
+            "end": ends[j],
+            "span_ms": span,
+            "deviation_ms": abs(span - target_ms),
+            "gap_after_ms": gaps[j] if j + 1 < n else None,
+            "entry_count": j - i + 1,
+            "first_lines": entries[i]["lines"],
+        })
+        i = j + 1
+    return chapters, None
+
+
+def _chapter_infeasible_reason(entries: List[dict], dp: list,
+                               min_ms: int, max_ms: int) -> str:
+    """定位最靠后的不可行起点，给出无法切分的具体原因。
+
+    bad 之后的位置均可行（bad 是最大的不可行下标），故从 bad 出发若存在
+    跨度落在 [min_ms, max_ms] 内的首章，dp[bad] 就不会不可行——即所有
+    候选首章跨度都越过了该区间：要么全部剩余字幕总跨度仍不足最短，
+    要么某处从「不足最短」直接跳到「超过最长」（单条字幕自身即超最长
+    是其特例）。
+    """
+    n = len(entries)
+    bad = max(i for i in range(n) if dp[i] is None)
+    e = entries[bad]
+    head = (f"第 {bad + 1} 条字幕（序号 {e['index']}，"
+            f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}）")
+    start = e["start"]
+    total_span = entries[-1]["end"] - start
+    if total_span < min_ms:
+        return (f"{head}起至末尾全部字幕的总跨度 {total_span / 1000:.3f} 秒"
+                f"仍不足最短章节时长 {min_ms / 1000:g} 秒，无法成章")
+    prev_span = None
+    prev_j = None
+    for j in range(bad, n):
+        span = entries[j]["end"] - start
+        if span > max_ms:
+            if prev_span is None:
+                return (f"{head}自身时长 {span / 1000:.3f} 秒已超过最长章节时长 "
+                        f"{max_ms / 1000:g} 秒，章节不能从字幕中间切开，无法切分")
+            pe = entries[prev_j]
+            return (f"{head}起：截至第 {prev_j + 1} 条（序号 {pe['index']}）的跨度 "
+                    f"{prev_span / 1000:.3f} 秒仍不足最短章节时长 {min_ms / 1000:g} 秒，"
+                    f"再并入第 {j + 1} 条（序号 {entries[j]['index']}）后跨度 "
+                    f"{span / 1000:.3f} 秒又超过最长章节时长 {max_ms / 1000:g} 秒，"
+                    "相邻字幕间没有可行的切点，无法切分")
+        prev_span, prev_j = span, j
+    return f"{head}附近不存在可行的章节切分，无法切分"  # 防御：理论不可达
+
+
+def _chapter_prepare(req: "ChapterRequest"):
+    """章节索引公共预处理：校验参数、解析并校验轨道，失败抛 400。"""
+    try:
+        target_ms, min_ms, max_ms = _chapter_params(req)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        entries = parse_srt(req.srt)
+        _validate_speed_track(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, target_ms, min_ms, max_ms
+
+
+def _chapter_payload(c: dict, seq: int) -> dict:
+    return {
+        "seq": seq,
+        "start": fmt_time(c["start"]),
+        "end": fmt_time(c["end"]),
+        "start_ms": c["start"],
+        "end_ms": c["end"],
+        "duration_ms": c["span_ms"],
+        "deviation_ms": c["deviation_ms"],
+        "entry_count": c["entry_count"],
+        "src_first": c["src_first"],
+        "src_last": c["src_last"],
+        "first_index": c["first_index"],
+        "last_index": c["last_index"],
+        "gap_after_ms": c["gap_after_ms"],
+        "first_text": "\n".join(c["first_lines"]),
+    }
+
+
+@app.post("/api/chapter/preview")
+def chapter_preview(req: ChapterRequest):
+    entries, target_ms, min_ms, max_ms = _chapter_prepare(req)
+    chapters, reason = plan_chapters(entries, target_ms, min_ms, max_ms)
+    if chapters is None:
+        return {"feasible": False, "reason": reason, "entry_count": len(entries)}
+    return {
+        "feasible": True,
+        "entry_count": len(entries),
+        "chapter_count": len(chapters),
+        "target_seconds": req.target_seconds,
+        "min_seconds": req.min_seconds,
+        "max_seconds": req.max_seconds,
+        "total_deviation_ms": sum(c["deviation_ms"] for c in chapters),
+        "total_gap_ms": sum(c["gap_after_ms"] or 0 for c in chapters),
+        "chapters": [_chapter_payload(c, k) for k, c in enumerate(chapters, 1)],
+    }
+
+
+_CHAPTER_CSV_HEADER = ["章节号", "起点(ms)", "终点(ms)", "时长(ms)", "与目标偏差(ms)",
+                       "起点", "终点", "字幕条数", "首条序号", "末条序号", "首句"]
+
+
+@app.post("/api/chapter/export")
+def chapter_export(req: ChapterRequest):
+    entries, target_ms, min_ms, max_ms = _chapter_prepare(req)
+    chapters, reason = plan_chapters(entries, target_ms, min_ms, max_ms)
+    if chapters is None:
+        raise HTTPException(status_code=400, detail=f"无法切分章节：{reason}")
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")  # RFC 4180：CRLF、按需加引号
+    writer.writerow(_CHAPTER_CSV_HEADER)
+    for k, c in enumerate(chapters, 1):
+        writer.writerow([
+            k,
+            c["start"],
+            c["end"],
+            c["span_ms"],
+            c["deviation_ms"],
+            fmt_time(c["start"]),
+            fmt_time(c["end"]),
+            c["entry_count"],
+            c["first_index"],
+            c["last_index"],
+            "\n".join(c["first_lines"]),
+        ])
+    # UTF-8 BOM，确保 Excel 直接双击打开时中文不乱码
+    return Response(
+        content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="chapters.csv"'},
     )
